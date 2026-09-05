@@ -3,24 +3,25 @@ import json
 import logging
 import msgpack
 import websockets
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, List
 from tenacity import retry, stop_after_attempt, wait_exponential
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
 class LanChatClient:
-    """Клиент для работы с LanChat API через WebSocket"""
+    """Клиент для работы с LanChat API через WebSocket и HTTP"""
     
-    def __init__(self, token: str, ws_url: str):
+    def __init__(self, token: str, ws_url: str, api_url: str = "https://msgpublic.langame.ru"):
         self.token = token
         self.ws_url = ws_url
+        self.api_url = api_url
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.subscribed_chats = set()
         self.message_handlers = []
         self._running = False
-        self._reconnect_task = None
-        
+    
     def on_message(self, handler: Callable):
         """Декоратор для регистрации обработчика сообщений"""
         self.message_handlers.append(handler)
@@ -45,7 +46,6 @@ class LanChatClient:
                 )
                 logger.info("WebSocket подключен успешно")
                 
-                # Отправляем auth кадр для подтверждения
                 auth_frame = msgpack.packb({"t": "auth", "token": self.token})
                 await self.websocket.send(auth_frame)
                 
@@ -58,7 +58,7 @@ class LanChatClient:
             await connect_with_retry()
             return True
         except Exception as e:
-            logger.error(f"Не удалось подключиться после всех попыток: {e}")
+            logger.error(f"Не удалось подключиться: {e}")
             return False
     
     async def subscribe(self, chat_id: str):
@@ -77,7 +77,7 @@ class LanChatClient:
             logger.info(f"Подписка на чат {chat_id} отправлена")
             return True
         except Exception as e:
-            logger.error(f"Ошибка подписки на чат {chat_id}: {e}")
+            logger.error(f"Ошибка подписки: {e}")
             return False
     
     async def listen(self):
@@ -91,16 +91,11 @@ class LanChatClient:
         try:
             async for raw_message in self.websocket:
                 try:
-                    # Декодируем MessagePack
                     message = msgpack.unpackb(raw_message, raw=False)
-                    logger.debug(f"Получено сообщение: {json.dumps(message, ensure_ascii=False, default=str)}")
-                    
-                    # Проверяем тип сообщения
                     msg_type = message.get("t")
                     
                     if msg_type == "authed":
                         logger.info("✅ Авторизация в LanChat успешна")
-                        # После авторизации подписываемся на чаты
                         for chat_id in self.subscribed_chats:
                             await self.subscribe(chat_id)
                     
@@ -112,12 +107,9 @@ class LanChatClient:
                         logger.info(f"✅ Подписка на чат {chat_id} подтверждена")
                     
                     elif msg_type == "message_new":
-                        # Новое сообщение - обрабатываем
                         chat_id = message.get("chatId")
                         msg_data = message.get("message", {})
-                        logger.info(f"📨 Новое сообщение в чате {chat_id} от {msg_data.get('user', {}).get('name', 'Unknown')}")
                         
-                        # Вызываем все зарегистрированные обработчики
                         for handler in self.message_handlers:
                             try:
                                 if asyncio.iscoroutinefunction(handler):
@@ -125,11 +117,7 @@ class LanChatClient:
                                 else:
                                     handler(chat_id, msg_data)
                             except Exception as e:
-                                logger.error(f"Ошибка в обработчике сообщения: {e}")
-                    
-                    elif msg_type == "message_update":
-                        # Обновление сообщения (опционально)
-                        logger.debug(f"Обновление сообщения: {message.get('message', {}).get('id')}")
+                                logger.error(f"Ошибка в обработчике: {e}")
                     
                     elif msg_type == "error":
                         error_code = message.get("code")
@@ -140,12 +128,6 @@ class LanChatClient:
                             logger.critical("❌ Ошибка авторизации! Проверьте токен")
                             break
                     
-                    elif msg_type == "pong":
-                        logger.debug("Pong получен")
-                    
-                    else:
-                        logger.debug(f"Получен кадр типа {msg_type}")
-                        
                 except msgpack.exceptions.UnpackException as e:
                     logger.error(f"Ошибка распаковки MessagePack: {e}")
                 except Exception as e:
@@ -154,27 +136,70 @@ class LanChatClient:
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning(f"WebSocket соединение закрыто: {e}")
             self._running = False
-            # Попытка переподключения
             await self._reconnect()
         except Exception as e:
             logger.error(f"Ошибка в listen: {e}")
             self._running = False
     
     async def _reconnect(self):
-        """Переподключение при обрыве соединения"""
+        """Переподключение при обрыве"""
         if self._running:
             logger.info("Попытка переподключения через 5 секунд...")
             await asyncio.sleep(5)
             
             if await self.connect():
-                # Заново подписываемся на все чаты
                 for chat_id in self.subscribed_chats:
                     await self.subscribe(chat_id)
-                
-                # Запускаем прослушивание заново
                 asyncio.create_task(self.listen())
             else:
                 logger.error("Не удалось переподключиться")
+    
+    async def get_available_chats(self) -> List[Dict[str, Any]]:
+        """Получение списка доступных чатов"""
+        url = f"{self.api_url}/api/public/chats"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        chats = data.get("chats", data.get("data", []))
+                        logger.info(f"📋 Получено {len(chats)} доступных чатов")
+                        return chats
+                    else:
+                        error = await resp.text()
+                        logger.error(f"Ошибка получения чатов: {resp.status} - {error}")
+                        return []
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            return []
+    
+    async def find_chat_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+        """Поиск чата по названию"""
+        chats = await self.get_available_chats()
+        for chat in chats:
+            chat_title = chat.get("title", "")
+            if title.lower() in chat_title.lower():
+                return chat
+        return None
+    
+    async def get_chat_info(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Получение информации о чате"""
+        url = f"{self.api_url}/api/public/chats/{chat_id}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.error(f"Ошибка получения чата {chat_id}: {resp.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            return None
     
     async def close(self):
         """Закрытие соединения"""
