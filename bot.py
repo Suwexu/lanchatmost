@@ -172,7 +172,8 @@ async def handle_chat_selection(update: Update, context: ContextTypes.DEFAULT_TY
             await lanchat_client.subscribe(chat_id)
             await query.message.reply_text(
                 f"✅ Бот подключен к чату!\n"
-                f"📡 Chat ID: <code>{chat_id}</code>",
+                f"📡 Chat ID: <code>{chat_id}</code>\n\n"
+                "📊 Бот работает в режиме HTTP Polling",
                 parse_mode="HTML"
             )
 
@@ -397,7 +398,7 @@ async def start_telegram_bot():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     telegram_bot = application.bot
     
-    # Создаем обработчики команд правильно (без декораторов)
+    # Создаем обработчики команд
     start_handler = CommandHandler("start", start_command)
     status_handler = CommandHandler("status", status_command)
     ping_handler = CommandHandler("ping", ping_command)
@@ -433,7 +434,7 @@ async def start_telegram_bot():
         await asyncio.sleep(1)
 
 
-# ===== ВЫНЕСЕННЫЕ ФУНКЦИИ-КОМАНДЫ =====
+# ===== КОМАНДЫ =====
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != TELEGRAM_CHAT_ID:
@@ -445,7 +446,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 <b>LanChat ↔ Telegram Бот</b>\n\n"
         f"✅ Статус: <b>Активен</b>\n"
         f"📡 Чат LanChat: {chat_info}\n"
-        f"🔄 <b>Двусторонняя синхронизация</b>\n\n"
+        f"🔄 <b>Двусторонняя синхронизация</b>\n"
+        f"📊 Режим: <b>HTTP Polling</b>\n\n"
         "Команды:\n"
         "/status - Статус бота\n"
         "/ping - Проверка соединения\n"
@@ -460,7 +462,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ запрещен.")
         return
     
-    status = "✅ Подключен" if lanchat_client and lanchat_client._running else "❌ Отключен"
+    status = "✅ Активен" if lanchat_client and lanchat_client._running else "❌ Остановлен"
     chat_id = LANCHAT_CHAT_ID or "❌ Не выбран"
     
     await update.message.reply_text(
@@ -468,7 +470,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"LanChat: {status}\n"
         f"Chat ID: <code>{chat_id}</code>\n"
         f"Обработано: <b>{len(processed_messages)}</b>\n"
-        f"Подписанных чатов: <b>{len(lanchat_client.subscribed_chats) if lanchat_client else 0}</b>",
+        f"Подписанных чатов: <b>{len(lanchat_client.subscribed_chats) if lanchat_client else 0}</b>\n"
+        f"Режим: <b>HTTP Polling</b> (каждые {lanchat_client.poll_interval if lanchat_client else 3} сек)",
         parse_mode="HTML"
     )
 
@@ -477,7 +480,7 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != TELEGRAM_CHAT_ID:
         await update.message.reply_text("❌ Доступ запрещен.")
         return
-    await update.message.reply_text("🏓 Pong!")
+    await update.message.reply_text("🏓 Pong! Бот работает в режиме HTTP Polling")
 
 
 async def select_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +499,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 <b>Помощь</b>\n\n"
         "🔄 <b>Двусторонняя синхронизация</b>\n\n"
         "1️⃣ <b>LanChat → Telegram</b>\n"
-        "   - Все сообщения автоматически пересылаются\n"
+        "   - Сообщения проверяются каждые 3 секунды\n"
         "   - Поддерживаются: текст, стикеры, вложения, реакции\n\n"
         "2️⃣ <b>Telegram → LanChat</b>\n"
         "   - Отправьте текст → появится в LanChat\n"
@@ -519,32 +522,30 @@ async def main():
     
     logger.info("🚀 Запуск LanChat ↔ Telegram бота")
     logger.info("🔄 Режим: ДВУСТОРОННЯЯ СИНХРОНИЗАЦИЯ")
-    logger.info(f"📡 Подключение к: {LANCHAT_WS_URL}")
+    logger.info("📡 Режим работы: HTTP Polling (WebSocket недоступен в Railway)")
     
+    # Создаем клиент с HTTP polling
     lanchat_client = LanChatClient(LANCHAT_TOKEN, LANCHAT_WS_URL, LANCHAT_API_URL)
     lanchat_client.on_message(handle_lanchat_message)
+    lanchat_client.poll_interval = 3  # Проверка каждые 3 секунды
     
-    # Пробуем подключиться к LanChat с увеличенным таймаутом
+    # Ищем и подписываемся на чат
     try:
-        if await lanchat_client.connect():
-            logger.info("✅ Подключение к LanChat установлено")
+        chat_id = await find_and_select_chat()
+        if chat_id:
+            LANCHAT_CHAT_ID = chat_id
+            await lanchat_client.subscribe(LANCHAT_CHAT_ID)
+            logger.info(f"✅ Подписка на чат {LANCHAT_CHAT_ID} выполнена")
             
-            chat_id = await find_and_select_chat()
-            if chat_id:
-                LANCHAT_CHAT_ID = chat_id
-                await lanchat_client.subscribe(LANCHAT_CHAT_ID)
-                logger.info(f"✅ Подписка на чат {LANCHAT_CHAT_ID} выполнена")
-            else:
-                logger.warning("⚠️ Чат не выбран. Используйте /select_chat в Telegram")
-            
+            # Запускаем polling в фоне
             asyncio.create_task(lanchat_client.listen())
+            logger.info("✅ HTTP Polling запущен")
         else:
-            logger.error("❌ Не удалось подключиться к LanChat")
-            # Бот все равно запустится, но без LanChat
+            logger.warning("⚠️ Чат не выбран. Используйте /select_chat в Telegram")
     except Exception as e:
-        logger.error(f"❌ Ошибка подключения к LanChat: {e}")
+        logger.error(f"❌ Ошибка настройки: {e}")
     
-    # Запускаем Telegram бота (он будет работать даже без LanChat)
+    # Запускаем Telegram бота
     await start_telegram_bot()
 
 
