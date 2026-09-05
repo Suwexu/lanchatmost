@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import msgpack
 import websockets
 from typing import Optional, Dict, Any, Callable, List
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -46,7 +45,8 @@ class LanChatClient:
                 )
                 logger.info("WebSocket подключен успешно")
                 
-                auth_frame = msgpack.packb({"t": "auth", "token": self.token})
+                # Отправляем auth кадр в формате JSON
+                auth_frame = json.dumps({"t": "auth", "token": self.token})
                 await self.websocket.send(auth_frame)
                 
                 return True
@@ -68,7 +68,7 @@ class LanChatClient:
             return False
         
         try:
-            subscribe_frame = msgpack.packb({
+            subscribe_frame = json.dumps({
                 "t": "subscribe",
                 "chatId": chat_id
             })
@@ -91,7 +91,8 @@ class LanChatClient:
         try:
             async for raw_message in self.websocket:
                 try:
-                    message = msgpack.unpackb(raw_message, raw=False)
+                    # Парсим JSON сообщение
+                    message = json.loads(raw_message)
                     msg_type = message.get("t")
                     
                     if msg_type == "authed":
@@ -128,8 +129,14 @@ class LanChatClient:
                             logger.critical("❌ Ошибка авторизации! Проверьте токен")
                             break
                     
-                except msgpack.exceptions.UnpackException as e:
-                    logger.error(f"Ошибка распаковки MessagePack: {e}")
+                    elif msg_type == "pong":
+                        logger.debug("Pong получен")
+                    
+                    else:
+                        logger.debug(f"Получен кадр типа {msg_type}")
+                        
+                except json.JSONDecodeError as e:
+                    logger.error(f"Ошибка парсинга JSON: {e}")
                 except Exception as e:
                     logger.error(f"Ошибка обработки сообщения: {e}")
                     
