@@ -1,2 +1,4 @@
 python-telegram-bot==21.10
+websockets==14.1
+tenacity==9.0.0
 aiohttp==3.11.13
