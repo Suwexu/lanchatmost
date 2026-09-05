@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 from typing import Optional, Dict, Any, Callable, List
 import aiohttp
@@ -17,17 +16,16 @@ class LanChatClient:
         self.message_handlers = []
         self._running = False
         self._stop_polling = False
-        self.last_message_ids = {}  # ID последнего сообщения для каждого чата
-        self.poll_interval = 3
+        self.last_message_ids = {}
+        self.poll_interval = 5  # Увеличен до 5 секунд
         self._session: Optional[aiohttp.ClientSession] = None
+        self._retry_count = 3
     
     def on_message(self, handler: Callable):
-        """Регистрация обработчика сообщений"""
         self.message_handlers.append(handler)
         return handler
     
     async def subscribe(self, chat_id: str):
-        """Подписка на чат"""
         self.subscribed_chats.add(chat_id)
         if chat_id not in self.last_message_ids:
             self.last_message_ids[chat_id] = None
@@ -35,18 +33,45 @@ class LanChatClient:
         return True
     
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Получение сессии с таймаутами"""
         if self._session is None or self._session.closed:
+            # Увеличенные таймауты
             timeout = aiohttp.ClientTimeout(
-                total=30,
-                connect=10,
-                sock_read=20
+                total=45,
+                connect=15,
+                sock_read=30
             )
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
     
+    async def _make_request(self, method: str, url: str, **kwargs) -> Optional[dict]:
+        """Выполнение запроса с повторными попытками"""
+        for attempt in range(self._retry_count):
+            try:
+                session = await self._get_session()
+                headers = kwargs.pop("headers", {})
+                headers["Authorization"] = f"Bearer {self.token}"
+                
+                async with session.request(method, url, headers=headers, **kwargs) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status in [401, 403]:
+                        logger.error(f"Ошибка авторизации: {resp.status}")
+                        return None
+                    else:
+                        logger.warning(f"Ошибка {resp.status}, попытка {attempt+1}/{self._retry_count}")
+                        if attempt < self._retry_count - 1:
+                            await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
+                        continue
+            except Exception as e:
+                logger.warning(f"Ошибка запроса, попытка {attempt+1}/{self._retry_count}: {e}")
+                if attempt < self._retry_count - 1:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+        
+        logger.error(f"Не удалось выполнить запрос после {self._retry_count} попыток")
+        return None
+    
     async def listen(self):
-        """Прослушивание новых сообщений через HTTP polling"""
         if not self.subscribed_chats:
             logger.error("Нет подписанных чатов")
             return
@@ -91,62 +116,42 @@ class LanChatClient:
                 await asyncio.sleep(self.poll_interval * 2)
     
     async def get_messages(self, chat_id: str) -> List[Dict[str, Any]]:
-        """Получение сообщений из чата"""
         url = f"{self.api_url}/api/public/chats/{chat_id}/messages"
-        headers = {"Authorization": f"Bearer {self.token}"}
         params = {"limit": 20}
         
         try:
-            session = await self._get_session()
-            async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    messages = data.get("messages", data.get("items", data.get("list", [])))
-                    return messages
-                else:
-                    return []
+            data = await self._make_request("GET", url, params=params)
+            if data:
+                return data.get("messages", data.get("items", data.get("list", [])))
+            return []
         except Exception as e:
             logger.error(f"Ошибка получения сообщений: {e}")
             return []
     
     async def get_available_chats(self) -> List[Dict[str, Any]]:
-        """Получение списка доступных чатов"""
         url = f"{self.api_url}/api/public/chats"
-        headers = {"Authorization": f"Bearer {self.token}"}
         
         try:
-            session = await self._get_session()
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    chats = data.get("chats", data.get("data", data.get("items", [])))
-                    logger.info(f"📋 Получено {len(chats)} доступных чатов")
-                    return chats
-                else:
-                    logger.error(f"Ошибка получения чатов: {resp.status}")
-                    return []
+            data = await self._make_request("GET", url)
+            if data:
+                chats = data.get("chats", data.get("data", data.get("items", [])))
+                logger.info(f"📋 Получено {len(chats)} доступных чатов")
+                return chats
+            return []
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
+            logger.error(f"Ошибка получения чатов: {e}")
             return []
     
     async def get_chat_info(self, chat_id: str) -> Optional[Dict[str, Any]]:
-        """Получение информации о чате"""
         url = f"{self.api_url}/api/public/chats/{chat_id}"
-        headers = {"Authorization": f"Bearer {self.token}"}
         
         try:
-            session = await self._get_session()
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    return None
+            return await self._make_request("GET", url)
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
+            logger.error(f"Ошибка получения чата: {e}")
             return None
     
     async def close(self):
-        """Остановка клиента"""
         self._running = False
         self._stop_polling = True
         if self._session and not self._session.closed:
