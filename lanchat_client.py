@@ -3,14 +3,12 @@ import json
 import logging
 import websockets
 from typing import Optional, Dict, Any, Callable, List
-from tenacity import retry, stop_after_attempt, wait_exponential
-import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
 class LanChatClient:
-    """Клиент для работы с LanChat API через WebSocket + HTTP fallback"""
+    """Клиент для работы с LanChat API через WebSocket"""
     
     def __init__(self, token: str, ws_url: str = "wss://msgpublic.langame.ru/wsapi", 
                  api_url: str = "https://msgpublic.langame.ru"):
@@ -21,135 +19,92 @@ class LanChatClient:
         self.subscribed_chats = set()
         self.message_handlers = []
         self._running = False
-        self._reconnect_task = None
-        self.chats_available = []  # Список доступных чатов
+        self.chats_available = []
         self._chats_received = asyncio.Event()
     
     def on_message(self, handler: Callable):
-        """Регистрация обработчика сообщений"""
         self.message_handlers.append(handler)
         return handler
     
     async def connect(self):
-        """Подключение к WebSocket"""
-        uri = f"{self.ws_url}?token={self.token}"
-        
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=2, min=4, max=30)
-        )
-        async def connect_with_retry():
-            try:
-                logger.info(f"Подключение к LanChat WebSocket: {self.ws_url}")
-                self.websocket = await websockets.connect(
-                    uri,
-                    ping_interval=20,
-                    ping_timeout=60,
-                    close_timeout=30,
-                    max_size=10 * 1024 * 1024
-                )
-                logger.info("✅ WebSocket подключен")
-                return True
-            except Exception as e:
-                logger.error(f"Ошибка подключения к WebSocket: {e}")
-                raise
-        
         try:
-            await connect_with_retry()
+            uri = f"{self.ws_url}?token={self.token}"
+            logger.info(f"Подключение к WebSocket: {self.ws_url}")
+            self.websocket = await websockets.connect(
+                uri,
+                ping_interval=20,
+                ping_timeout=60,
+                close_timeout=30,
+                max_size=10 * 1024 * 1024
+            )
+            logger.info("✅ WebSocket подключен")
             return True
         except Exception as e:
-            logger.error(f"Не удалось подключиться: {e}")
+            logger.error(f"Ошибка подключения: {e}")
             return False
     
     async def authenticate(self):
-        """Отправка auth кадра"""
         if not self.websocket:
-            logger.error("WebSocket не подключен")
             return False
-        
         try:
             auth_frame = json.dumps({"t": "auth", "token": self.token})
             await self.websocket.send(auth_frame)
-            logger.info("🔑 Auth кадр отправлен")
+            logger.info("🔑 Auth отправлен")
             return True
         except Exception as e:
-            logger.error(f"Ошибка авторизации: {e}")
+            logger.error(f"Ошибка auth: {e}")
             return False
     
     async def subscribe(self, chat_id: str):
-        """Подписка на чат"""
         if not self.websocket:
-            logger.error("WebSocket не подключен")
             return False
-        
         try:
-            subscribe_frame = json.dumps({
-                "t": "subscribe",
-                "chatId": chat_id
-            })
-            await self.websocket.send(subscribe_frame)
+            frame = json.dumps({"t": "subscribe", "chatId": chat_id})
+            await self.websocket.send(frame)
             self.subscribed_chats.add(chat_id)
-            logger.info(f"📡 Подписка на чат {chat_id} отправлена")
+            logger.info(f"📡 Подписка на {chat_id}")
             return True
         except Exception as e:
             logger.error(f"Ошибка подписки: {e}")
             return False
     
     async def get_available_chats(self) -> List[Dict[str, Any]]:
-        """Получение списка доступных чатов через WebSocket"""
         self._chats_received.clear()
-        
-        if not self.websocket or not self._running:
-            logger.warning("WebSocket не активен, пытаемся подключиться...")
-            if not await self.connect():
-                logger.error("Не удалось подключиться к WebSocket")
-                return []
-            await self.authenticate()
-        
-        # Ждем получения списка чатов (максимум 10 секунд)
         try:
             await asyncio.wait_for(self._chats_received.wait(), timeout=10.0)
             return self.chats_available
         except asyncio.TimeoutError:
-            logger.warning("Таймаут ожидания списка чатов")
+            logger.warning("Таймаут получения чатов")
             return []
     
     async def listen(self):
-        """Прослушивание WebSocket"""
         if not self.websocket:
-            logger.error("WebSocket не подключен")
             return
         
         self._running = True
         
         try:
-            async for raw_message in self.websocket:
+            async for raw in self.websocket:
                 try:
-                    message = json.loads(raw_message)
-                    msg_type = message.get("t")
+                    msg = json.loads(raw)
+                    t = msg.get("t")
                     
-                    if msg_type == "authed":
-                        logger.info("✅ Авторизация в LanChat успешна")
-                        # После авторизации подписываемся на чаты
+                    if t == "authed":
+                        logger.info("✅ Авторизация успешна")
                         for chat_id in self.subscribed_chats:
                             await self.subscribe(chat_id)
                     
-                    elif msg_type == "chats_available":
-                        chats = message.get("chats", [])
-                        self.chats_available = chats
+                    elif t == "chats_available":
+                        self.chats_available = msg.get("chats", [])
                         self._chats_received.set()
-                        logger.info(f"📋 Получено {len(chats)} доступных чатов")
-                        for chat in chats:
-                            logger.info(f"  - {chat.get('title')} (ID: {chat.get('id')})")
+                        logger.info(f"📋 Получено {len(self.chats_available)} чатов")
                     
-                    elif msg_type == "subscribed":
-                        chat_id = message.get("chatId")
-                        logger.info(f"✅ Подписка на чат {chat_id} подтверждена")
+                    elif t == "subscribed":
+                        logger.info(f"✅ Подписка подтверждена: {msg.get('chatId')}")
                     
-                    elif msg_type == "message_new":
-                        chat_id = message.get("chatId")
-                        msg_data = message.get("message", {})
-                        
+                    elif t == "message_new":
+                        chat_id = msg.get("chatId")
+                        msg_data = msg.get("message", {})
                         for handler in self.message_handlers:
                             try:
                                 if asyncio.iscoroutinefunction(handler):
@@ -159,54 +114,23 @@ class LanChatClient:
                             except Exception as e:
                                 logger.error(f"Ошибка в обработчике: {e}")
                     
-                    elif msg_type == "message_update":
-                        logger.debug("Обновление сообщения")
-                    
-                    elif msg_type == "error":
-                        error_code = message.get("code")
-                        error_msg = message.get("message", "Unknown error")
-                        logger.error(f"❌ Ошибка LanChat: {error_code} - {error_msg}")
-                        
-                        if error_code in ["unauthorized", "auth_failed"]:
-                            logger.critical("❌ Ошибка авторизации! Проверьте токен")
+                    elif t == "error":
+                        logger.error(f"❌ Ошибка: {msg.get('code')} - {msg.get('message')}")
+                        if msg.get("code") in ["unauthorized", "auth_failed"]:
+                            logger.critical("❌ Ошибка авторизации!")
                             break
                     
-                    elif msg_type == "pong":
-                        logger.debug("🏓 Pong получен")
-                    
-                    else:
-                        logger.debug(f"Получен кадр типа {msg_type}")
-                        
                 except json.JSONDecodeError as e:
-                    logger.error(f"Ошибка парсинга JSON: {e}")
-                except Exception as e:
-                    logger.error(f"Ошибка обработки сообщения: {e}")
+                    logger.error(f"Ошибка JSON: {e}")
                     
         except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"WebSocket соединение закрыто: {e}")
+            logger.warning(f"Соединение закрыто: {e}")
             self._running = False
-            await self._reconnect()
         except Exception as e:
-            logger.error(f"Ошибка в listen: {e}")
+            logger.error(f"Ошибка: {e}")
             self._running = False
-    
-    async def _reconnect(self):
-        """Переподключение"""
-        if self._running:
-            logger.info("🔄 Попытка переподключения через 5 секунд...")
-            await asyncio.sleep(5)
-            
-            if await self.connect():
-                await self.authenticate()
-                for chat_id in self.subscribed_chats:
-                    await self.subscribe(chat_id)
-                asyncio.create_task(self.listen())
-            else:
-                logger.error("Не удалось переподключиться")
     
     async def close(self):
-        """Закрытие соединения"""
         self._running = False
         if self.websocket:
             await self.websocket.close()
-            logger.info("WebSocket соединение закрыто")
