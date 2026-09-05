@@ -4,7 +4,7 @@ import os
 import sys
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import aiohttp
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,13 +28,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === ВСЕ ПЕРЕМЕННЫЕ БЕРУТСЯ ИЗ ОКРУЖЕНИЯ RAILWAY ===
+# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LANCHAT_TOKEN = os.getenv("LANCHAT_API_TOKEN")
-LANCHAT_CHAT_ID = os.getenv("LANCHAT_CHAT_ID")
-LANCHAT_CHAT_TITLE = os.getenv("LANCHAT_CHAT_TITLE")
-LANCHAT_WS_URL = os.getenv("LANCHAT_WS_URL", "wss://msgpublic.langame.ru/wsapi")
 LANCHAT_API_URL = os.getenv("LANCHAT_API_URL", "https://msgpublic.langame.ru")
 
 # Проверка обязательных переменных
@@ -43,10 +40,6 @@ required_vars = {
     "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
     "LANCHAT_API_TOKEN": LANCHAT_TOKEN,
 }
-
-if not LANCHAT_CHAT_ID and not LANCHAT_CHAT_TITLE:
-    logger.error("❌ Укажите либо LANCHAT_CHAT_ID, либо LANCHAT_CHAT_TITLE")
-    sys.exit(1)
 
 missing_vars = [key for key, value in required_vars.items() if not value]
 if missing_vars:
@@ -57,61 +50,60 @@ if missing_vars:
 lanchat_client: Optional[LanChatClient] = None
 telegram_bot: Optional[Bot] = None
 processed_messages = set()
+selected_chat_id: Optional[str] = None
+selected_chat_title: Optional[str] = None
+available_chats_cache: list = []
 
 
-# ==================== ПОИСК ЧАТА ====================
+# ==================== ПОИСК ЧАТОВ ====================
 
-async def find_and_select_chat() -> Optional[str]:
-    """Поиск и выбор чата"""
-    global lanchat_client
+async def refresh_chats_cache() -> list:
+    """Обновление кэша доступных чатов"""
+    global available_chats_cache
     
     if not lanchat_client:
-        return None
+        return []
     
-    # Если ID указан напрямую
-    if LANCHAT_CHAT_ID:
-        logger.info(f"✅ Используем ID из переменных: {LANCHAT_CHAT_ID}")
-        chat_info = await lanchat_client.get_chat_info(LANCHAT_CHAT_ID)
-        if chat_info:
-            logger.info(f"✅ Чат найден: {chat_info.get('title')}")
-            return LANCHAT_CHAT_ID
-        else:
-            logger.warning(f"⚠️ Чат с ID {LANCHAT_CHAT_ID} не найден")
-    
-    # Поиск по названию
-    if LANCHAT_CHAT_TITLE:
-        logger.info(f"🔍 Ищем чат по названию: {LANCHAT_CHAT_TITLE}")
-        chat = await lanchat_client.find_chat_by_title(LANCHAT_CHAT_TITLE)
-        if chat:
-            chat_id = chat.get("id")
-            chat_title = chat.get("title")
-            logger.info(f"✅ Найден чат: {chat_title} (ID: {chat_id})")
-            return chat_id
-    
-    # Показываем список доступных чатов
-    chats = await lanchat_client.get_available_chats()
-    if not chats:
-        logger.error("❌ Нет доступных чатов")
-        return None
-    
-    # Если один чат - подписываемся на него
-    if len(chats) == 1:
-        chat_id = chats[0].get("id")
-        chat_title = chats[0].get("title")
-        logger.info(f"✅ Выбран единственный чат: {chat_title}")
-        return chat_id
-    
-    # Логируем доступные чаты
-    logger.info("📋 Доступные чаты:")
-    for idx, chat in enumerate(chats, 1):
-        logger.info(f"  {idx}. {chat.get('title')} (ID: {chat.get('id')})")
-    
-    # Возвращаем первый чат
-    first_chat = chats[0]
-    logger.warning(f"⚠️ Выбран первый чат: {first_chat.get('title')}")
-    logger.warning("Используйте /select_chat для выбора другого чата")
-    return first_chat.get("id")
+    try:
+        chats = await lanchat_client.get_available_chats()
+        available_chats_cache = chats
+        logger.info(f"📋 Обновлен кэш чатов: {len(chats)} доступно")
+        return chats
+    except Exception as e:
+        logger.error(f"Ошибка обновления кэша чатов: {e}")
+        return []
 
+
+async def auto_select_chat() -> Optional[str]:
+    """Автоматический выбор чата при запуске"""
+    global selected_chat_id, selected_chat_title
+    
+    chats = await refresh_chats_cache()
+    
+    if not chats:
+        logger.warning("⚠️ Нет доступных чатов")
+        return None
+    
+    # Если есть только один чат - выбираем его
+    if len(chats) == 1:
+        chat = chats[0]
+        selected_chat_id = chat.get("id")
+        selected_chat_title = chat.get("title", "Без названия")
+        logger.info(f"✅ Автоматически выбран единственный чат: {selected_chat_title}")
+        return selected_chat_id
+    
+    # Если несколько чатов - выбираем первый
+    first_chat = chats[0]
+    selected_chat_id = first_chat.get("id")
+    selected_chat_title = first_chat.get("title", "Без названия")
+    logger.info(f"📋 Доступно {len(chats)} чатов")
+    logger.info(f"✅ Выбран первый чат: {selected_chat_title}")
+    logger.info("💡 Используйте /select_chat для выбора другого чата")
+    
+    return selected_chat_id
+
+
+# ==================== ВЫБОР ЧАТА ====================
 
 async def show_chat_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать интерактивный выбор чата"""
@@ -119,28 +111,63 @@ async def show_chat_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Бот не подключен к LanChat")
         return
     
-    chats = await lanchat_client.get_available_chats()
+    await update.message.reply_text("🔄 Получение списка чатов...")
+    
+    chats = await refresh_chats_cache()
+    
     if not chats:
-        await update.message.reply_text("❌ Нет доступных чатов")
+        await update.message.reply_text(
+            "❌ Нет доступных чатов\n\n"
+            "Возможные причины:\n"
+            "1. Неправильный токен LanChat\n"
+            "2. Вы не состоите ни в одном чате\n"
+            "3. API LanChat недоступен\n\n"
+            "Проверьте токен и попробуйте снова."
+        )
         return
     
+    # Строим клавиатуру
     keyboard = []
-    for chat in chats[:10]:
+    for chat in chats[:20]:  # Показываем до 20 чатов
         chat_id = chat.get("id")
         chat_title = chat.get("title", "Без названия")
         is_channel = chat.get("isChannel", False)
         icon = "📢" if is_channel else "💬"
+        
+        # Получаем количество участников
+        participants = chat.get("participants", [])
+        members_count = len(participants) if participants else "?"
+        
+        # Формируем кнопку
+        button_text = f"{icon} {chat_title[:25]} ({members_count} уч.)"
+        if len(button_text) > 40:
+            button_text = button_text[:37] + "..."
+        
+        # Добавляем метку, если чат уже выбран
+        if chat_id == selected_chat_id:
+            button_text = "✅ " + button_text
+        
         button = InlineKeyboardButton(
-            f"{icon} {chat_title[:30]}",
+            button_text,
             callback_data=f"select_chat_{chat_id}"
         )
         keyboard.append([button])
     
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="select_cancel")])
+    # Добавляем служебные кнопки
+    keyboard.append([
+        InlineKeyboardButton("🔄 Обновить", callback_data="refresh_chats"),
+        InlineKeyboardButton("❌ Отмена", callback_data="select_cancel")
+    ])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    current_chat = f"Текущий чат: <b>{selected_chat_title or 'Не выбран'}</b>" if selected_chat_id else "⚠️ Чат не выбран"
+    
     await update.message.reply_text(
-        "📋 <b>Выберите чат для пересылки:</b>",
+        f"📋 <b>Выберите чат для пересылки</b>\n\n"
+        f"{current_chat}\n"
+        f"Всего чатов: <b>{len(chats)}</b>\n\n"
+        f"Нажмите на название, чтобы подписаться:",
         parse_mode="HTML",
         reply_markup=reply_markup
     )
@@ -152,40 +179,108 @@ async def handle_chat_selection(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     
     data = query.data
+    global selected_chat_id, selected_chat_title
     
     if data == "select_cancel":
         await query.edit_message_text("❌ Выбор отменен")
         return
     
-    if data.startswith("select_chat_"):
-        chat_id = data.replace("select_chat_", "")
-        global LANCHAT_CHAT_ID
-        LANCHAT_CHAT_ID = chat_id
+    if data == "refresh_chats":
+        await query.edit_message_text("🔄 Обновление списка чатов...")
+        chats = await refresh_chats_cache()
+        
+        if not chats:
+            await query.edit_message_text("❌ Нет доступных чатов")
+            return
+        
+        # Перестраиваем клавиатуру
+        keyboard = []
+        for chat in chats[:20]:
+            chat_id = chat.get("id")
+            chat_title = chat.get("title", "Без названия")
+            is_channel = chat.get("isChannel", False)
+            icon = "📢" if is_channel else "💬"
+            
+            button_text = f"{icon} {chat_title[:30]}"
+            if chat_id == selected_chat_id:
+                button_text = "✅ " + button_text
+            
+            button = InlineKeyboardButton(
+                button_text,
+                callback_data=f"select_chat_{chat_id}"
+            )
+            keyboard.append([button])
+        
+        keyboard.append([
+            InlineKeyboardButton("🔄 Обновить", callback_data="refresh_chats"),
+            InlineKeyboardButton("❌ Отмена", callback_data="select_cancel")
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        current_chat = f"Текущий чат: <b>{selected_chat_title or 'Не выбран'}</b>" if selected_chat_id else "⚠️ Чат не выбран"
         
         await query.edit_message_text(
-            f"✅ Выбран чат: <code>{chat_id}</code>\n\n"
-            "🔄 Переподключение...",
+            f"📋 <b>Выберите чат для пересылки</b>\n\n"
+            f"{current_chat}\n"
+            f"Всего чатов: <b>{len(chats)}</b>",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+        return
+    
+    if data.startswith("select_chat_"):
+        chat_id = data.replace("select_chat_", "")
+        
+        # Находим чат в кэше
+        chat_info = None
+        for chat in available_chats_cache:
+            if chat.get("id") == chat_id:
+                chat_info = chat
+                break
+        
+        if not chat_info:
+            await query.edit_message_text("❌ Чат не найден. Обновите список.")
+            return
+        
+        chat_title = chat_info.get("title", "Без названия")
+        is_channel = chat_info.get("isChannel", False)
+        chat_type = "канал" if is_channel else "чат"
+        
+        # Сохраняем выбор
+        selected_chat_id = chat_id
+        selected_chat_title = chat_title
+        
+        # Подписываемся на чат
+        await lanchat_client.subscribe(chat_id)
+        
+        # Если клиент уже работает, перезапускаем polling
+        if lanchat_client._running:
+            lanchat_client._stop_polling = True
+            await asyncio.sleep(1)
+            lanchat_client._stop_polling = False
+            asyncio.create_task(lanchat_client.listen())
+        
+        await query.edit_message_text(
+            f"✅ <b>Чат выбран!</b>\n\n"
+            f"📌 Название: <b>{chat_title}</b>\n"
+            f"📋 Тип: {chat_type}\n"
+            f"🆔 ID: <code>{chat_id}</code>\n\n"
+            f"📊 Режим: HTTP Polling (проверка каждые {lanchat_client.poll_interval} сек)\n\n"
+            f"Теперь все сообщения из этого чата будут пересылаться в Telegram.",
             parse_mode="HTML"
         )
         
-        if lanchat_client:
-            await lanchat_client.subscribe(chat_id)
-            await query.message.reply_text(
-                f"✅ Бот подключен к чату!\n"
-                f"📡 Chat ID: <code>{chat_id}</code>\n\n"
-                "📊 Бот работает в режиме HTTP Polling",
-                parse_mode="HTML"
-            )
+        logger.info(f"✅ Выбран чат: {chat_title} ({chat_id})")
 
 
 # ==================== ОТПРАВКА В LANCHAT ====================
 
 async def send_to_lanchat(text: str, reply_to_id: Optional[str] = None):
     """Отправка сообщения в LanChat"""
-    if not text or not LANCHAT_CHAT_ID:
+    if not text or not selected_chat_id:
         return None
     
-    url = f"{LANCHAT_API_URL}/api/public/chats/{LANCHAT_CHAT_ID}/messages"
+    url = f"{LANCHAT_API_URL}/api/public/chats/{selected_chat_id}/messages"
     headers = {
         "Authorization": f"Bearer {LANCHAT_TOKEN}",
         "Content-Type": "application/json"
@@ -196,7 +291,8 @@ async def send_to_lanchat(text: str, reply_to_id: Optional[str] = None):
         payload["replyToMessageId"] = reply_to_id
     
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status == 200:
                     result = await resp.json()
@@ -213,12 +309,12 @@ async def send_to_lanchat(text: str, reply_to_id: Optional[str] = None):
 
 async def send_media_to_lanchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправка медиа в LanChat"""
-    if not LANCHAT_CHAT_ID:
-        await update.message.reply_text("❌ ID чата не установлен")
+    if not selected_chat_id:
+        await update.message.reply_text("❌ Сначала выберите чат через /select_chat")
         return
     
     message = update.message
-    url = f"{LANCHAT_API_URL}/api/public/chats/{LANCHAT_CHAT_ID}/messages"
+    url = f"{LANCHAT_API_URL}/api/public/chats/{selected_chat_id}/messages"
     headers = {"Authorization": f"Bearer {LANCHAT_TOKEN}"}
     
     file = None
@@ -239,7 +335,7 @@ async def send_media_to_lanchat(update: Update, context: ContextTypes.DEFAULT_TY
         file = await message.audio.get_file()
         file_name = f"audio_{message.audio.file_id}.mp3"
     else:
-        await message.reply_text("❌ Неподдерживаемый тип")
+        await message.reply_text("❌ Неподдерживаемый тип файла")
         return
     
     try:
@@ -250,7 +346,8 @@ async def send_media_to_lanchat(update: Update, context: ContextTypes.DEFAULT_TY
             data.add_field("text", caption)
         data.add_field("file", file_data, filename=file_name)
         
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, data=data, headers=headers) as resp:
                 if resp.status == 200:
                     result = await resp.json()
@@ -332,7 +429,8 @@ async def format_lanchat_message(msg_data: dict) -> str:
 async def handle_lanchat_message(chat_id: str, msg_data: dict):
     """Обработчик сообщений из LanChat"""
     try:
-        if chat_id != LANCHAT_CHAT_ID:
+        # Проверяем, что сообщение из выбранного чата
+        if chat_id != selected_chat_id:
             return
         
         msg_id = msg_data.get("id")
@@ -364,6 +462,10 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ Доступ запрещен.")
         return
     
+    if not selected_chat_id:
+        await update.message.reply_text("❌ Чат не выбран. Используйте /select_chat")
+        return
+    
     message = update.message
     text = message.text
     
@@ -386,7 +488,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
                 parse_mode="HTML"
             )
         else:
-            await update.message.reply_text("❌ Ошибка отправки")
+            await update.message.reply_text("❌ Ошибка отправки в LanChat")
 
 
 # ==================== TELEGRAM БОТ ====================
@@ -398,20 +500,14 @@ async def start_telegram_bot():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     telegram_bot = application.bot
     
-    # Создаем обработчики команд
-    start_handler = CommandHandler("start", start_command)
-    status_handler = CommandHandler("status", status_command)
-    ping_handler = CommandHandler("ping", ping_command)
-    select_chat_handler = CommandHandler("select_chat", select_chat_command)
-    help_handler = CommandHandler("help", help_command)
+    # Команды
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("ping", ping_command))
+    application.add_handler(CommandHandler("select_chat", select_chat_command))
+    application.add_handler(CommandHandler("help", help_command))
     
-    application.add_handler(start_handler)
-    application.add_handler(status_handler)
-    application.add_handler(ping_handler)
-    application.add_handler(select_chat_handler)
-    application.add_handler(help_handler)
-    
-    # Обработчики для callback query
+    # Обработчики callback query
     application.add_handler(CallbackQueryHandler(handle_chat_selection, pattern="^select_"))
     
     # Обработчики сообщений (Telegram → LanChat)
@@ -421,7 +517,7 @@ async def start_telegram_bot():
     ))
     
     application.add_handler(MessageHandler(
-        (filters.PHOTO | filters.DOCUMENT | filters.VIDEO | filters.AUDIO) & filters.Chat(chat_id=int(TELEGRAM_CHAT_ID)),
+        filters.ATTACHMENT & filters.Chat(chat_id=int(TELEGRAM_CHAT_ID)),
         send_media_to_lanchat
     ))
     
@@ -441,14 +537,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ запрещен.")
         return
     
-    chat_info = f"<code>{LANCHAT_CHAT_ID}</code>" if LANCHAT_CHAT_ID else "❌ Не выбран"
+    chat_info = f"<b>{selected_chat_title}</b> (<code>{selected_chat_id}</code>)" if selected_chat_id else "❌ Не выбран"
+    
     await update.message.reply_text(
         f"🤖 <b>LanChat ↔ Telegram Бот</b>\n\n"
         f"✅ Статус: <b>Активен</b>\n"
-        f"📡 Чат LanChat: {chat_info}\n"
+        f"📡 Текущий чат: {chat_info}\n"
         f"🔄 <b>Двусторонняя синхронизация</b>\n"
         f"📊 Режим: <b>HTTP Polling</b>\n\n"
-        "Команды:\n"
+        "💡 <b>Первые шаги:</b>\n"
+        "1. Используйте /select_chat для выбора чата\n"
+        "2. Бот покажет все доступные чаты\n"
+        "3. Выберите нужный чат и начнется пересылка\n\n"
+        "📋 Команды:\n"
         "/status - Статус бота\n"
         "/ping - Проверка соединения\n"
         "/select_chat - Выбрать чат\n"
@@ -463,14 +564,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     status = "✅ Активен" if lanchat_client and lanchat_client._running else "❌ Остановлен"
-    chat_id = LANCHAT_CHAT_ID or "❌ Не выбран"
+    
+    chat_info = "❌ Не выбран"
+    if selected_chat_id:
+        chat_info = f"<b>{selected_chat_title}</b> (<code>{selected_chat_id}</code>)"
     
     await update.message.reply_text(
         f"📊 <b>Статус бота</b>\n\n"
         f"LanChat: {status}\n"
-        f"Chat ID: <code>{chat_id}</code>\n"
-        f"Обработано: <b>{len(processed_messages)}</b>\n"
-        f"Подписанных чатов: <b>{len(lanchat_client.subscribed_chats) if lanchat_client else 0}</b>\n"
+        f"Чат: {chat_info}\n"
+        f"Обработано сообщений: <b>{len(processed_messages)}</b>\n"
+        f"Доступно чатов: <b>{len(available_chats_cache)}</b>\n"
         f"Режим: <b>HTTP Polling</b> (каждые {lanchat_client.poll_interval if lanchat_client else 3} сек)",
         parse_mode="HTML"
     )
@@ -480,7 +584,7 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != TELEGRAM_CHAT_ID:
         await update.message.reply_text("❌ Доступ запрещен.")
         return
-    await update.message.reply_text("🏓 Pong! Бот работает в режиме HTTP Polling")
+    await update.message.reply_text("🏓 Pong! Бот работает")
 
 
 async def select_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -505,6 +609,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   - Отправьте текст → появится в LanChat\n"
         "   - Ответьте на сообщение бота → ответ в LanChat\n"
         "   - Отправьте фото/документ → отправится в LanChat\n\n"
+        "💡 <b>Как начать:</b>\n"
+        "   1. Используйте /select_chat\n"
+        "   2. Выберите чат из списка\n"
+        "   3. Бот начнет пересылку\n\n"
         "Команды:\n"
         "/start - Старт\n"
         "/status - Статус\n"
@@ -518,30 +626,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== MAIN ====================
 
 async def main():
-    global lanchat_client, LANCHAT_CHAT_ID
+    global lanchat_client, selected_chat_id, selected_chat_title
     
     logger.info("🚀 Запуск LanChat ↔ Telegram бота")
     logger.info("🔄 Режим: ДВУСТОРОННЯЯ СИНХРОНИЗАЦИЯ")
-    logger.info("📡 Режим работы: HTTP Polling (WebSocket недоступен в Railway)")
+    logger.info("📡 Режим работы: HTTP Polling")
+    logger.info(f"🌐 API URL: {LANCHAT_API_URL}")
+    logger.info("🔑 Авторизация по токену LanChat")
     
-    # Создаем клиент с HTTP polling
-    lanchat_client = LanChatClient(LANCHAT_TOKEN, LANCHAT_WS_URL, LANCHAT_API_URL)
+    # Создаем клиент
+    lanchat_client = LanChatClient(LANCHAT_TOKEN, LANCHAT_API_URL)
     lanchat_client.on_message(handle_lanchat_message)
     lanchat_client.poll_interval = 3  # Проверка каждые 3 секунды
     
-    # Ищем и подписываемся на чат
+    # Автоматический поиск чатов
     try:
-        chat_id = await find_and_select_chat()
+        logger.info("🔍 Поиск доступных чатов...")
+        chat_id = await auto_select_chat()
+        
         if chat_id:
-            LANCHAT_CHAT_ID = chat_id
-            await lanchat_client.subscribe(LANCHAT_CHAT_ID)
-            logger.info(f"✅ Подписка на чат {LANCHAT_CHAT_ID} выполнена")
+            await lanchat_client.subscribe(chat_id)
+            logger.info(f"✅ Подписка на чат {chat_id} выполнена")
             
-            # Запускаем polling в фоне
+            # Запускаем polling
             asyncio.create_task(lanchat_client.listen())
             logger.info("✅ HTTP Polling запущен")
         else:
-            logger.warning("⚠️ Чат не выбран. Используйте /select_chat в Telegram")
+            logger.warning("⚠️ Чаты не найдены. Используйте /select_chat в Telegram")
     except Exception as e:
         logger.error(f"❌ Ошибка настройки: {e}")
     
